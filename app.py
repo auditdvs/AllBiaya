@@ -423,6 +423,8 @@ def is_transaction_row(row):
 def parse_uploaded_xls(uploaded_file):
     """
     ERP reports are frequently HTML files saved with .xls extension.
+    A single MDIS export can (and normally does) contain many accounts one
+    after another, separated by "Account No. / Account Name" header rows.
     Valid NO DATA reports are returned as an empty dataframe.
     """
     raw = uploaded_file.getvalue()
@@ -832,65 +834,87 @@ def style_sheet(ws, widths=None):
 
 
 def build_excel(results_df, coa_df):
+    """
+    Builds a single workbook:
+      - Sheet "All Data": every transaction from the uploaded file(s),
+        tagged with KODE AKUN / NAMA AKUN so accounts stay identifiable.
+      - One sheet per Account Name (NAMA AKUN): every transaction that
+        belongs to that account, regardless of COA-matching status.
+
+    Every sheet uses the same simple layout:
+        VOUCHER NO. | TRANS. DATE | ENTRY DATE | DESCRIPTION | DEBIT | CREDIT
+    DEBIT / CREDIT are taken only from the "Amount in Base CCY" columns
+    (DEBIT BASE / CREDIT BASE) — forex amounts are not included.
+    """
     output = io.BytesIO()
     used_sheets = set()
 
-    compliant_cols = [
+    detail_cols = [
         "VOUCHER NO.", "TRANS. DATE", "ENTRY DATE", "DESCRIPTION",
-        "DEBIT BASE", "CREDIT BASE", "DEBIT FOREX", "CREDIT FOREX",
+        "DEBIT", "CREDIT",
     ]
 
-    noncompliant_cols = [
-        "KODE AKUN", "NAMA AKUN", "VOUCHER NO.", "TRANS. DATE",
-        "ENTRY DATE", "DESCRIPTION", "STATUS", "MATCH SCORE",
-        "MATCHED CRITERIA", "ALTERNATIVE COA", "ALTERNATIVE ACCOUNT",
-        "ALTERNATIVE FILE", "REVIEW REASON",
-    ]
+    # The raw MDIS export bakes branch/regional text into the account name
+    # (e.g. "ATK, Foto Copy dan Cetakan - Cabang Cipanas - Regional J"),
+    # which is both long and inconsistent across files. Prefer the clean
+    # Nama Akun from the COA (keyed by Kode Akun) for display/sheet naming,
+    # and only fall back to the raw parsed name if the code isn't in COA.
+    coa_name_lookup = {}
+    if coa_df is not None:
+        for _, coa_row in coa_df.iterrows():
+            code = str(coa_row["KODE AKUN"]).strip()
+            name = str(coa_row["NAMA AKUN"]).strip()
+            if code and name:
+                coa_name_lookup[code] = name
+
+    data = results_df.copy()
+    data["DEBIT"] = data["DEBIT BASE"]
+    data["CREDIT"] = data["CREDIT BASE"]
+    data["NAMA AKUN"] = data.apply(
+        lambda r: coa_name_lookup.get(str(r["KODE AKUN"]).strip(), r["NAMA AKUN"]),
+        axis=1,
+    )
+
+    # Sort chronologically within each account without changing the
+    # original text formatting of TRANS. DATE.
+    data["_SORT_DATE"] = pd.to_datetime(
+        data["TRANS. DATE"], dayfirst=True, errors="coerce"
+    )
+    data = data.sort_values(["KODE AKUN", "_SORT_DATE"]).drop(columns=["_SORT_DATE"])
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # One workbook.
-        # One sheet per account contains ONLY transactions considered SESUAI.
-        # A separate global sheet "Tidak Sesuai" contains all exceptions.
-        for account_code, group in results_df.groupby("KODE AKUN", sort=True):
-            account_name = (
-                group["NAMA AKUN"].dropna().iloc[0]
-                if not group["NAMA AKUN"].dropna().empty
-                else account_code
-            )
+        # ---- "All Data" sheet: everything, with account identifiers ----
+        all_data_cols = ["KODE AKUN", "NAMA AKUN"] + detail_cols
+        all_data_sheet = safe_sheet_name("All Data", used_sheets)
+        data[all_data_cols].to_excel(writer, sheet_name=all_data_sheet, index=False)
 
-            compliant = group[group["STATUS"] == "SESUAI"][compliant_cols].copy()
+        ws = writer.book[all_data_sheet]
+        style_sheet(ws, {
+            "A": 13, "B": 40, "C": 24, "D": 13, "E": 13,
+            "F": 60, "G": 18, "H": 18,
+        })
 
-            sheet_title = safe_sheet_name(
-                f"{account_code}_{account_name}",
-                used_sheets,
-            )
-            compliant.to_excel(
-                writer,
-                sheet_name=sheet_title,
-                index=False,
-            )
+        # ---- One sheet per Account Name, in COA order when possible ----
+        coa_order = list(coa_df["KODE AKUN"]) if coa_df is not None else []
+        codes_present = [c for c in data["KODE AKUN"].unique().tolist() if c]
+        ordered_codes = (
+            [c for c in coa_order if c in codes_present]
+            + [c for c in codes_present if c not in coa_order]
+        )
+
+        for code in ordered_codes:
+            group = data[data["KODE AKUN"] == code]
+            names = group["NAMA AKUN"].dropna()
+            names = names[names.astype(str).str.strip() != ""]
+            account_name = names.iloc[0] if not names.empty else code
+
+            sheet_title = safe_sheet_name(account_name, used_sheets)
+            group[detail_cols].to_excel(writer, sheet_name=sheet_title, index=False)
 
             ws = writer.book[sheet_title]
             style_sheet(ws, {
-                "A": 24, "B": 13, "C": 13, "D": 60,
-                "E": 18, "F": 18, "G": 18, "H": 18,
+                "A": 24, "B": 13, "C": 13, "D": 60, "E": 18, "F": 18,
             })
-
-        exceptions = results_df[
-            results_df["STATUS"] != "SESUAI"
-        ][noncompliant_cols].copy()
-
-        exceptions.to_excel(
-            writer,
-            sheet_name=safe_sheet_name("Tidak Sesuai", used_sheets),
-            index=False,
-        )
-        ws = writer.book["Tidak Sesuai"]
-        style_sheet(ws, {
-            "A": 13, "B": 42, "C": 24, "D": 13, "E": 13,
-            "F": 60, "G": 20, "H": 13, "I": 40, "J": 15,
-            "K": 42, "L": 35, "M": 60,
-        })
 
     output.seek(0)
     return output.getvalue()
@@ -902,7 +926,6 @@ def build_excel(results_df, coa_df):
 
 st.set_page_config(
     page_title="COA Transaction Checker",
-    page_icon=None,
     layout="wide",
 )
 
@@ -912,35 +935,40 @@ st.caption(
     "dan seluruh akun pada COA untuk mendeteksi salah klasifikasi."
 )
 
-with st.container(border=True):
-    st.markdown("**Ketentuan file yang diupload**")
-    st.markdown(
-        "- Upload file **.xls asli langsung dari MDIS** (Transaction Listing "
-        "by Accounts), jangan dibuka lalu disimpan ulang lewat Excel karena "
-        "format HTML di dalamnya bisa berubah dan gagal terbaca.\n"
-        "- Tool ini hanya menangani **24 akun** berikut. File dari akun di "
-        "luar daftar ini akan tetap diproses tapi ditandai sebagai di luar "
-        "cakupan."
+with st.expander("Cara download file `.xls` dan daftar akun yang dicakup", expanded=False):
+    st.markdown("""
+**Cara download file `.xls` secara langsung seluruh akun:**
+
+1. Buka menu **Transaction by account**
+2. **Transaction date** form diisi tanggal yang akan dicek (biasanya periode audit)
+3. **From Account No.:** `54100000-KODE CABANG-KODE REGIONAL` *(Contoh: 54100000-024-10)*
+4. **To Account No.:** `59924000-KODE CABANG-KODE REGIONAL` *(Contoh: 59924000-024-10)*
+5. **Source Code** diisi: `TPB-KODE CABANG` *(Contoh: TPB-024)*
+6. **Update status:** All, **Type:** Printing
+7. Klik kirim ke excel lalu simpan, nanti file yang sudah disimpan tinggal di upload ke **Upload file transaksi**
+""")
+    st.divider()
+    st.markdown("**Daftar 24 akun yang dicakup:**")
+    akun_df = pd.DataFrame(
+        [{"KODE AKUN": k, "NAMA AKUN": v} for k, v in ALLOWED_ACCOUNTS.items()]
     )
-    with st.expander("Lihat daftar 24 akun yang dicakup"):
-        akun_df = pd.DataFrame(
-            [{"KODE AKUN": k, "NAMA AKUN": v} for k, v in ALLOWED_ACCOUNTS.items()]
-        )
-        st.dataframe(akun_df, use_container_width=True, hide_index=True)
+    st.dataframe(akun_df, use_container_width=True, hide_index=True)
 
-st.warning(
-    "**Disclaimer:** hasil klasifikasi di tool ini bersifat indikatif, "
-    "bukan kesimpulan final. Deskripsi transaksi dari MDIS sangat bebas "
-    "formatnya (typo, singkatan tidak konsisten, urutan kata berubah-ubah), "
-    "sehingga pencocokan otomatis tidak bisa menangkap semua variasi. "
-    "Status REVIEW, TIDAK SESUAI, dan SALAH KLASIFIKASI tetap perlu "
-    "diverifikasi manual oleh auditor sebelum dijadikan dasar keputusan."
-)
+with st.expander("Disclaimer", expanded=False):
+    st.warning(
+        "Hasil klasifikasi di tool ini bersifat indikatif, "
+        "bukan kesimpulan final. Deskripsi transaksi dari MDIS sangat bebas "
+        "formatnya (typo, singkatan tidak konsisten, urutan kata berubah-ubah), "
+        "sehingga pencocokan otomatis tidak bisa menangkap semua variasi. "
+        "Status REVIEW, TIDAK SESUAI, dan SALAH KLASIFIKASI tetap perlu "
+        "diverifikasi manual oleh auditor sebelum dijadikan dasar keputusan."
+    )
 
-st.subheader("1. Sumber data")
+st.divider()
+st.subheader("1. Sumber Data")
 
 with st.container(border=True):
-    input_col1, input_col2 = st.columns([3, 2])
+    input_col1, input_col2 = st.columns([3, 2], gap="large")
 
     with input_col1:
         coa_url = st.text_input(
@@ -955,12 +983,13 @@ with st.container(border=True):
                 st.rerun()
 
     with input_col2:
-        uploaded_files = st.file_uploader(
-            "Upload file transaksi (.xls / .xlsx)",
-            type=["xls", "xlsx"],
-            accept_multiple_files=True,
-            help="Bisa upload beberapa akun sekaligus.",
+        single_upload = st.file_uploader(
+            "Upload file transaksi (.xls)",
+            type=["xls"],
+            accept_multiple_files=False,
+            help="Cukup 1 file export MDIS yang sudah berisi seluruh akun.",
         )
+        uploaded_files = [single_upload] if single_upload is not None else []
 
     st.caption(
         "Threshold: SESUAI >= 78%. REVIEW 50-77.9%. "
@@ -987,6 +1016,7 @@ if coa_df.empty:
     st.error("COA tidak memiliki data yang dapat digunakan.")
     st.stop()
 
+st.divider()
 st.subheader("2. Ringkasan COA")
 
 col1, col2, col3 = st.columns(3)
@@ -1006,35 +1036,12 @@ col3.metric(
     int((coa_df["KRITERIA TRANSAKSI"].astype(str).str.strip() != "").sum()),
 )
 
-with st.expander("Preview COA yang digunakan"):
-    st.dataframe(
-        coa_df[
-            ["KODE AKUN", "NAMA AKUN", "KRITERIA TRANSAKSI", "KELOMPOK"]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    kosong = coa_df[coa_df["KRITERIA TRANSAKSI"].astype(str).str.strip() == ""]
-    if not kosong.empty:
-        st.warning(
-            f"{len(kosong)} akun belum memiliki Kriteria Transaksi di COA. "
-            "Transaksi pada akun ini akan otomatis ditandai REVIEW "
-            "karena tidak ada dasar pencocokan sama sekali."
-        )
-        st.dataframe(
-            kosong[["KODE AKUN", "NAMA AKUN"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
 if not uploaded_files:
-    st.info("Upload satu atau beberapa file Transaction Listing by Accounts untuk mulai analisis.")
+    st.info("Upload file Transaction Listing by Accounts (1 file, semua akun) untuk mulai analisis.")
     st.stop()
 
 all_transactions = []
 parse_errors = []
-
 no_data_files = []
 
 for uploaded_file in uploaded_files:
@@ -1082,6 +1089,7 @@ if not out_of_scope.empty:
 
 results = analyze_transactions(transactions, coa_df)
 
+st.divider()
 st.subheader("3. Hasil Analisis")
 
 metric_cols = st.columns(5)
@@ -1132,11 +1140,12 @@ excel_bytes = build_excel(results, coa_df)
 dl1, dl2 = st.columns([1, 5])
 with dl1:
     st.download_button(
-        label="Download XLSX",
+        label="📥 Download XLSX",
         data=excel_bytes,
-        file_name="hasil_cek_kesesuaian_COA.xlsx",
+        file_name="rekap_transaksi_per_akun.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
+        use_container_width=True,
     )
 
 st.dataframe(
@@ -1176,7 +1185,8 @@ review = results[
 ].copy()
 
 if not review.empty:
-    st.subheader("Prioritas Review Auditor")
+    st.divider()
+    st.subheader("🔎 Prioritas Review Auditor")
     st.dataframe(
         review[
             [
@@ -1198,6 +1208,8 @@ if not review.empty:
     )
 
 st.caption(
-    "Output: 1 workbook, 1 sheet per akun untuk transaksi SESUAI, "
-    "ditambah 1 sheet global 'Tidak Sesuai' untuk seluruh transaksi yang perlu review."
+    "Output: 1 workbook, sheet 'All Data' berisi seluruh transaksi, "
+    "ditambah 1 sheet per Account Name (Nama Akun) berisi transaksi akun "
+    "tersebut. Kolom DEBIT/CREDIT pada file Excel diambil dari Amount in "
+    "Base CCY (bukan forex)."
 )
