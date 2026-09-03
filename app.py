@@ -950,7 +950,7 @@ with st.expander("Cara download file `.xls` dan daftar akun yang dicakup", expan
 7. Klik **Kirim ke Excel**, kemudian simpan file `.xls` yang dihasilkan.
 8. File `.xls` yang sudah disimpan **langsung di-upload ke menu Upload file transaksi**.
 """)
-
+    st.image("panduan.png", use_container_width=True)
     st.divider()
 
     st.markdown("**Daftar 24 akun yang dicakup:**")
