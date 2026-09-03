@@ -937,22 +937,28 @@ st.caption(
 
 with st.expander("Cara download file `.xls` dan daftar akun yang dicakup", expanded=False):
     st.markdown("""
-**Cara download file `.xls` secara langsung seluruh akun:**
+**Cara download 1 file `.xls` yang berisi transaksi seluruh akun:**
+
+> **Catatan:** Cukup download **1 file `.xls` untuk seluruh akun** sesuai range akun yang ditentukan. **Tidak perlu download file satu per satu per akun dan tidak perlu menggabungkan beberapa file secara manual.**
 
 1. Buka menu **Transaction by account**
-2. **Transaction date** form diisi tanggal yang akan dicek (biasanya periode audit)
+2. **Transaction date** diisi tanggal yang akan dicek (biasanya periode audit)
 3. **From Account No.:** `54100000-KODE CABANG-KODE REGIONAL` *(Contoh: 54100000-024-10)*
 4. **To Account No.:** `59924000-KODE CABANG-KODE REGIONAL` *(Contoh: 59924000-024-10)*
 5. **Source Code** diisi: `TPB-KODE CABANG` *(Contoh: TPB-024)*
 6. **Update status:** All, **Type:** Printing
-7. Klik kirim ke excel lalu simpan, nanti file yang sudah disimpan tinggal di upload ke **Upload file transaksi**
+7. Klik **Kirim ke Excel**, kemudian simpan file `.xls` yang dihasilkan.
+8. File `.xls` yang sudah disimpan **langsung di-upload ke menu Upload file transaksi**.
 """)
+
     st.divider()
+
     st.markdown("**Daftar 24 akun yang dicakup:**")
     akun_df = pd.DataFrame(
         [{"KODE AKUN": k, "NAMA AKUN": v} for k, v in ALLOWED_ACCOUNTS.items()]
     )
     st.dataframe(akun_df, use_container_width=True, hide_index=True)
+
 
 with st.expander("Disclaimer", expanded=False):
     st.warning(
